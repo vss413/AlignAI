@@ -1,0 +1,52 @@
+import os
+
+def extract_text_docx(file_path):
+    from docx import Document
+    doc = Document(file_path)
+    text = []
+
+    # Extract paragraphs
+    for para in doc.paragraphs:
+        if para.text.strip():
+            text.append(para.text)
+
+    # Extract tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    text.append(cell.text)
+    
+    # Join all text with a newline, or other separator if needed
+    return "\n".join(text)
+
+
+def extract_text_pdf(file_path):
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTTextContainer
+    text = ""
+    for page_layout in extract_pages(file_path):
+        for element in page_layout:
+            if isinstance(element, LTTextContainer):
+                text += element.get_text()
+    return text
+
+def parse_document(file_path):
+    ext = os.path.splitext(file_path)[-1].lower()
+    if ext == ".docx":
+        content = extract_text_docx(file_path)
+        print("DOCX parsing complete. Output:")
+        print(content)
+        return content
+    elif ext == ".pdf":
+        content = extract_text_pdf(file_path)
+        print("PDF parsing complete. Output:")
+        print(content)
+        return content
+    else:
+        raise ValueError("Unsupported file type. Please use .docx or .pdf.")
+
+# ---- Example usage ----
+file_path = "C:\\Users\\zenit\\Downloads\\95970987.pdf"  # Change to 'your_file.pdf' for PDFs
+parsed_text = parse_document(file_path)
+# parsed_text now contains the raw text ready for sectioning
