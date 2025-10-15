@@ -1,0 +1,30 @@
+import fitz  # PyMuPDF
+
+def extract_headings_by_blocks(pdf_path):
+    doc = fitz.open(pdf_path)
+    all_blocks = []
+
+    for page in doc:
+        blocks = page.get_text("dict")["blocks"]
+        for block in blocks:
+            block_text = ""
+            if "lines" in block:
+                for line in block["lines"]:
+                    line_text = " ".join(span["text"].strip() for span in line["spans"] if span["text"].strip())
+                    if line_text:
+                        block_text += line_text + "\n"
+                block_text = block_text.strip()
+                if block_text:
+                    all_blocks.append(block_text)
+    doc.close()
+    return all_blocks
+
+# Example usage
+pdf_path = "zenith updated resume.pdf"
+blocks = extract_headings_by_blocks(pdf_path)
+
+print("Extracted Headings by Block:\n")
+for block in blocks:
+    print(block)
+    print("-" * 40)
+
