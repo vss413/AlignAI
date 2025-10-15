@@ -1,0 +1,64 @@
+import fitz  # PyMuPDF
+import pymupdf4llm
+import difflib
+
+pdf_path = "zenith updated resume.pdf"
+
+# Step 1: Extract text blocks by detecting columns
+def extract_column_aware_blocks(pdf_path, column_gap=50):
+    doc = fitz.open(pdf_path)
+    all_blocks = []
+
+    for page in doc:
+        blocks = page.get_text("blocks", sort=True)  # simpler structure, pre-sorted
+        # Sort blocks first left-to-right (x0), then top-to-bottom (y0)
+        blocks = sorted(blocks, key=lambda b: (b[0], b[1]))  
+        
+        # Separate columns based on x-coordinates
+        left_col, right_col = [], []
+        if blocks:
+            page_width = page.rect.width
+            center_line = page_width / 2
+            
+            for b in blocks:
+                x0, y0, x1, y1, text, *_ = b
+                if x1 < center_line - column_gap:
+                    left_col.append((y0, text.strip()))
+                else:
+                    right_col.append((y0, text.strip()))
+            
+            # Sort both columns by y position and extend in reading order
+            left_col_sorted = [t for _, t in sorted(left_col)]
+            right_col_sorted = [t for _, t in sorted(right_col)]
+            
+            # Combine column text with a separator for clarity
+            combined = right_col_sorted + left_col_sorted
+            all_blocks.extend([t for t in combined if t])
+    
+    doc.close()
+    return all_blocks
+
+blocks_code1 = extract_column_aware_blocks(pdf_path)
+
+# Step 2: PyMuPDF4LLM extraction (structured version for order)
+md_text = pymupdf4llm.to_markdown(pdf_path)
+blocks_code2 = [block.strip() for block in md_text.split('\n\n') if block.strip() and len(block.strip()) > 5]
+
+# Step 3: Find missing blocks from code 1 relative to code 2
+def is_similar(b1, b2, threshold=0.65):
+    b1 = b1.lower().strip()
+    b2 = b2.lower().strip()
+    return difflib.SequenceMatcher(None, b1, b2).ratio() > threshold
+
+missing_from_code2 = []
+for block1 in blocks_code1:
+    if not any(is_similar(block1, block2) for block2 in blocks_code2):
+        missing_from_code2.append(block1)
+
+# Step 4: Strictly preserve code 2’s order and append missing column-separated blocks at the end
+final_blocks = blocks_code2 + missing_from_code2
+
+print("Extracted Headings by Block (Column-Aware, Strict Code 2 Order):\n")
+for block in final_blocks:
+    print(block)
+    print("-" * 40)
