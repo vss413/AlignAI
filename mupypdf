@@ -1,0 +1,102 @@
+import fitz  # PyMuPDF
+
+def extract_bold_headings_segment_blocks(pdf_path, min_fontsize=10, bold_keyword='bold'):
+    doc = fitz.open(pdf_path)
+    page_count = len(doc)
+    page_headings = []
+
+    # 1. Gather headings with their rectangles and page numbers
+    for page_num, page in enumerate(doc):
+        blocks = page.get_text("dict")["blocks"]
+        for block in blocks:
+            if "lines" in block:
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        is_bold = bold_keyword in span["font"].lower()
+                        is_large = span["size"] >= min_fontsize
+                        if is_bold and is_large:
+                            clean_text = span["text"].strip()
+                            if clean_text:
+                                rect = fitz.Rect(span["bbox"])
+                                page_headings.append({
+                                    "page": page_num,
+                                    "heading": clean_text,
+                                    "rect": rect
+                                })
+
+    # 2. Process each heading-region, segment into sub-blocks by bold text
+    extracted = []
+    for idx, heading in enumerate(page_headings):
+        this_page = heading["page"]
+        top = heading["rect"].y0
+
+        # Define end of region logic as before
+        if idx + 1 < len(page_headings):
+            next_heading = page_headings[idx + 1]
+            if next_heading["page"] == this_page:
+                bottom = next_heading["rect"].y0
+                end_page = this_page
+            else:
+                end_page = next_heading["page"]
+                bottom = doc[end_page].rect.y1
+        else:
+            end_page = page_count - 1
+            bottom = doc[end_page].rect.y1
+
+        region_texts = []
+        for pg in range(this_page, end_page+1):
+            page = doc[pg]
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                block_rect = fitz.Rect(block.get("bbox", [0, 0, 0, 0]))
+                in_range = False
+                if this_page == end_page:
+                    in_range = (block_rect.y0 >= top) and (block_rect.y1 <= bottom)
+                elif pg == this_page:
+                    in_range = (block_rect.y0 >= top)
+                elif pg == end_page:
+                    in_range = (block_rect.y1 <= bottom)
+                else:
+                    in_range = True
+                if in_range and "lines" in block:
+                    for line in block["lines"]:
+                        region_texts.append(line["spans"])
+
+        # Flatten and segment region_texts at bold transitions
+        sub_blocks = []
+        block_buffer = []
+        for line_spans in region_texts:
+            for span in line_spans:
+                text = span["text"].strip()
+                if not text:
+                    continue
+                is_bold = bold_keyword in span["font"].lower()
+                if is_bold:
+                    if block_buffer:
+                        sub_blocks.append(" ".join(block_buffer).strip())
+                        block_buffer = []
+                block_buffer.append(text)
+        if block_buffer:
+            sub_blocks.append(" ".join(block_buffer).strip())
+
+        # Store each sub-block with the heading
+        section_blocks = [{"block": b} for b in sub_blocks if b]
+        extracted.append({
+            "start_page": this_page + 1,
+            "end_page": end_page + 1,
+            "heading": heading["heading"],
+            "blocks": section_blocks
+        })
+
+    doc.close()
+    return extracted
+
+# Example usage
+pdf_path = "C:\\Users\\zenit\\Downloads\\zenith updated resume parsing.pdf"
+sections = extract_bold_headings_segment_blocks(pdf_path, min_fontsize=10, bold_keyword='bold')
+
+for section in sections:
+    print(f"\nPage {section['start_page']}-{section['end_page']} - Heading: {section['heading']}")
+    for bidx, blk in enumerate(section["blocks"]):
+        print(f"  Block {bidx+1}: {blk['block']}")
+    print('-'*40)
