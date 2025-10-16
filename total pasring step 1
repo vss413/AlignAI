@@ -1,0 +1,136 @@
+import os
+import fitz  # PyMuPDF
+import pymupdf4llm
+import difflib
+from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+
+# ======================================
+# UNIVERSAL TEXT EXTRACTION FUNCTION
+# ======================================
+def extract_text(file_path):
+    """Main entry: choose PDF or DOCX pipeline automatically."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        return extract_pdf_blocks(file_path)
+    elif ext in [".docx", ".doc"]:
+        return extract_docx_text_highlight_headings(file_path)
+    else:
+        raise ValueError("Unsupported file type. Use PDF or DOCX.")
+
+# ======================================
+# DOCX PARSING WITH HIGHLIGHTED HEADINGS
+# ======================================
+def is_heading(paragraph):
+    # Adjust this list after inspecting your doc's styles
+    return paragraph.style.name.startswith('Heading')
+
+def iter_block_items(parent):
+    parent_elm = parent.element.body
+    for child in parent_elm.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
+
+def extract_docx_text_highlight_headings(filepath):
+    doc = Document(filepath)
+    text = []
+    for block in iter_block_items(doc):
+        if isinstance(block, Paragraph):
+            if is_heading(block) and block.text.strip():
+                # Highlight heading visually
+                text.append('\n=== ' + block.text.upper() + ' ===\n')
+            else:
+                text.append(block.text)
+        elif isinstance(block, Table):
+            for row in block.rows:
+                row_text = []
+                prior_tc = None
+                for cell in row.cells:
+                    if cell._tc == prior_tc:
+                        continue
+                    prior_tc = cell._tc
+                    cell_paragraphs = [p.text for p in cell.paragraphs]
+                    row_text.append(' '.join(cell_paragraphs))
+                text.append('\t'.join(row_text))
+    return text  # Returns a list of blocks, as in your PDF output
+
+# ======================================
+# PDF PARSING (COLUMN-AWARE & MERGED)
+# ======================================
+def extract_column_aware_blocks(pdf_path, column_gap=50):
+    doc = fitz.open(pdf_path)
+    all_blocks = []
+    for page in doc:
+        blocks = page.get_text("blocks", sort=True)
+        blocks = sorted(blocks, key=lambda b: (b[0], b[1]))
+        left_col, right_col = [], []
+        if blocks:
+            page_width = page.rect.width
+            center_line = page_width / 2
+            for b in blocks:
+                x0, y0, x1, y1, text, *_ = b
+                if x1 < center_line - column_gap:
+                    left_col.append((y0, text.strip()))
+                else:
+                    right_col.append((y0, text.strip()))
+            left_col_sorted = [t for _, t in sorted(left_col)]
+            right_col_sorted = [t for _, t in sorted(right_col)]
+            combined = right_col_sorted + left_col_sorted
+            all_blocks.extend([t for t in combined if t])
+    doc.close()
+    return all_blocks
+
+def extract_pdf_blocks(pdf_path):
+    blocks_code1 = extract_column_aware_blocks(pdf_path)
+    md_text = pymupdf4llm.to_markdown(pdf_path)
+    blocks_code2 = [
+        block.strip()
+        for block in md_text.split('\n\n')
+        if block.strip() and len(block.strip()) > 5
+    ]
+    md_chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+    page_chunk_blocks = [
+        chunk["text"].strip()
+        for chunk in md_chunks
+        if isinstance(chunk, dict) and "text" in chunk and chunk["text"].strip()
+    ]
+    def is_similar(b1, b2, threshold=0.65):
+        b1 = b1.lower().strip()
+        b2 = b2.lower().strip()
+        return difflib.SequenceMatcher(None, b1, b2).ratio() > threshold
+
+    missing_from_code2 = []
+    for block1 in blocks_code1:
+        if not any(is_similar(block1, block2) for block2 in blocks_code2):
+            missing_from_code2.append(block1)
+    final_blocks = blocks_code2 + missing_from_code2
+    return final_blocks, page_chunk_blocks
+
+# ======================================
+# DRIVER
+# ======================================
+if __name__ == "__main__":
+    file_path = "5334098-construction-project-coordinator-resume-example.pdf"  # Replace as needed
+    extracted_output = extract_text(file_path)
+
+    if isinstance(extracted_output, tuple):
+        final_blocks, page_chunks = extracted_output
+    else:
+        final_blocks = extracted_output
+        page_chunks = []
+
+    print(f"\nExtracted Headings by Block from: {os.path.basename(file_path)}\n")
+    for block in final_blocks:
+        print(block)
+        print("-" * 40)
+
+    if page_chunks:
+        print("\n================ PAGE CHUNKED OUTPUT ================\n")
+        for i, chunk in enumerate(page_chunks, 1):
+            print(f"--- Page {i} ---\n{chunk}\n")
+            print("=" * 50)
