@@ -1,0 +1,233 @@
+import os
+import re
+import fitz  # PyMuPDF
+import pymupdf4llm
+import difflib
+from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from sentence_transformers import SentenceTransformer, util
+import spacy
+from spacy.matcher import Matcher
+
+# =====================================================
+# UNIVERSAL TEXT EXTRACTION FUNCTION
+# =====================================================
+def extract_text(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        return extract_pdf_blocks(file_path)
+    elif ext in [".docx", ".doc"]:
+        return extract_docx_text_highlight_headings(file_path)
+    else:
+        raise ValueError("Unsupported file type. Use PDF or DOCX.")
+
+# =====================================================
+# DOCX PARSING WITH HIGHLIGHTED HEADINGS
+# =====================================================
+def is_heading(paragraph):
+    return paragraph.style.name.startswith("Heading")
+
+def iter_block_items(parent):
+    parent_elm = parent.element.body
+    for child in parent_elm.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
+
+def extract_docx_text_highlight_headings(filepath):
+    doc = Document(filepath)
+    text = []
+    for block in iter_block_items(doc):
+        if isinstance(block, Paragraph):
+            if is_heading(block) and block.text.strip():
+                text.append(block.text.strip())
+            else:
+                text.append(block.text)
+        elif isinstance(block, Table):
+            for row in block.rows:
+                row_text = []
+                prior_tc = None
+                for cell in row.cells:
+                    if cell._tc == prior_tc:
+                        continue
+                    prior_tc = cell._tc
+                    cell_paragraphs = [p.text for p in cell.paragraphs]
+                    row_text.append(" ".join(cell_paragraphs))
+                text.append("\t".join(row_text))
+    return text
+
+# =====================================================
+# PDF PARSING (COLUMN-AWARE & MERGED)
+# =====================================================
+def extract_column_aware_blocks(pdf_path, column_gap=50):
+    doc = fitz.open(pdf_path)
+    all_blocks = []
+    for page in doc:
+        blocks = page.get_text("blocks", sort=True)
+        blocks = sorted(blocks, key=lambda b: (b[0], b[1]))
+        left_col, right_col = [], []
+        if blocks:
+            page_width = page.rect.width
+            center_line = page_width / 2
+            for b in blocks:
+                x0, y0, x1, y1, text, *_ = b
+                if x1 < center_line - column_gap:
+                    left_col.append((y0, text.strip()))
+                else:
+                    right_col.append((y0, text.strip()))
+            left_col_sorted = [t for _, t in sorted(left_col)]
+            right_col_sorted = [t for _, t in sorted(right_col)]
+            combined = right_col_sorted + left_col_sorted
+            all_blocks.extend([t for t in combined if t])
+    doc.close()
+    return all_blocks
+
+def extract_pdf_blocks(pdf_path):
+    blocks_code1 = extract_column_aware_blocks(pdf_path)
+    md_text = pymupdf4llm.to_markdown(pdf_path)
+    blocks_code2 = [
+        block.strip()
+        for block in md_text.split("\n\n")
+        if block.strip() and len(block.strip()) > 5
+    ]
+    md_chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+    page_chunk_blocks = [
+        chunk["text"].strip()
+        for chunk in md_chunks
+        if isinstance(chunk, dict) and "text" in chunk and chunk["text"].strip()
+    ]
+
+    def is_similar(b1, b2, threshold=0.65):
+        b1 = b1.lower().strip()
+        b2 = b2.lower().strip()
+        return difflib.SequenceMatcher(None, b1, b2).ratio() > threshold
+
+    missing_from_code2 = []
+    for block1 in blocks_code1:
+        if not any(is_similar(block1, block2) for block2 in blocks_code2):
+            missing_from_code2.append(block1)
+    final_blocks = blocks_code2 + missing_from_code2
+    return final_blocks, page_chunk_blocks
+
+# =====================================================
+# SEMANTIC HEADING DETECTION + SECTION GROUPING
+# =====================================================
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+canonical_headings = [
+    "experience", "work experience", "education", "academic history",
+    "projects", "technical projects", "skills", "key skills",
+    "certifications", "achievements", "publications", "personal details", "Contact",
+    "TECHNICAL SKILLS", "Professional Experience"
+]
+canonical_embeddings = model.encode(canonical_headings, convert_to_tensor=True)
+
+def semantic_heading_detection(lines, threshold=0.7):
+    headings = []
+    for line in lines:
+        line_clean = line.strip().lower()
+        if not line_clean or len(line_clean) < 3:
+            continue
+        emb = model.encode(line_clean, convert_to_tensor=True)
+        cosine_scores = util.cos_sim(emb, canonical_embeddings)[0]
+        max_score = float(cosine_scores.max())
+        if max_score >= threshold:
+            headings.append(line.strip())
+    return headings
+
+def semantic_sectioning(lines, threshold=0.7):
+    detected_headings = semantic_heading_detection(lines, threshold)
+    sections = {}
+    current_section = None
+    buffer = []
+
+    for line in lines:
+        if line.strip() in detected_headings:
+            if current_section and buffer:
+                sections[current_section] = "\n".join(buffer).strip()
+            current_section = line.strip()
+            buffer = []
+        else:
+            buffer.append(line.strip())
+
+    if current_section and buffer:
+        sections[current_section] = "\n".join(buffer).strip()
+
+    return sections
+
+# =====================================================
+# ENHANCED MEANINGFUL WORDS EXTRACTION FROM SECTION TEXTS
+# =====================================================
+nlp = spacy.load("en_core_web_md")  # or "en_core_web_lg"
+
+def extract_meaningful_words(text):
+    doc = nlp(text)
+    keywords = set()
+
+    # Extract noun chunks (multi-word phrases)
+    for chunk in doc.noun_chunks:
+        keywords.add(chunk.text.strip().lower())
+
+    # Extract important tokens (nouns, proper nouns, adjectives with nouns)
+    for token in doc:
+        if token.pos_ in ["NOUN", "PROPN"] and len(token.text) > 2:
+            keywords.add(token.text.strip().lower())
+        elif token.pos_ == "ADJ" and token.head.pos_ == "NOUN":
+            keywords.add(f"{token.text.strip().lower()} {token.head.text.strip().lower()}")
+
+    # Extract named entities for organizations, products, persons, etc.
+    for ent in doc.ents:
+        if ent.label_ in ["ORG", "PERSON", "PRODUCT"]:  # Add "SKILL" if your model supports it
+            keywords.add(ent.text.strip().lower())
+
+    # Use Matcher for additional bigram/trigram keywords (multi-noun phrases)
+    matcher = Matcher(nlp.vocab)
+    pattern = [
+        {"POS": "NOUN", "OP": "+"},
+        {"POS": "NOUN", "OP": "*"},
+    ]
+    matcher.add("NOUN_PHRASE", [pattern])
+    matches = matcher(doc)
+    for _, start, end in matches:
+        span = doc[start:end]
+        if len(span) > 1:
+            keywords.add(span.text.strip().lower())
+
+    return list(keywords)
+
+# =====================================================
+# DRIVER
+# =====================================================
+if __name__ == "__main__":
+    file_path = "5334098-construction-project-coordinator-resume-example.pdf"
+    extracted_output = extract_text(file_path)
+
+    if isinstance(extracted_output, tuple):
+        final_blocks, page_chunks = extracted_output
+    else:
+        final_blocks = extracted_output
+        page_chunks = []
+
+    print(f"\nParsed Output from: {os.path.basename(file_path)}")
+    print("\n================ RAW PARSED TEXT BLOCKS ================\n")
+    for block in final_blocks:
+        print(block)
+        print("-" * 40)
+
+    print("\n================ SEMANTIC SECTIONING OUTPUT ================\n")
+    sections = semantic_sectioning(final_blocks)
+
+    for heading, content in sections.items():
+        print(f"\n### {heading.upper()} ###\n{content}\n")
+        print("=" * 60)
+
+    print("\n================ EXTRACTED MEANINGFUL WORDS PER SECTION ================\n")
+    for heading, content in sections.items():
+        clean_content = content.replace('\n', ' ')
+        words = extract_meaningful_words(clean_content)
+        print(f"\n### {heading.upper()} ###")
+        print(words)
+        print("=" * 60)
