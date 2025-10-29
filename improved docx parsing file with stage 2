@@ -1,0 +1,195 @@
+import os
+import fitz  # PyMuPDF
+import pymupdf4llm
+from docx2python import docx2python
+from sentence_transformers import SentenceTransformer, util
+import spacy
+
+# ================================
+# UNIVERSAL TEXT EXTRACTION
+# ================================
+def extract_text(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        return extract_pdf_blocks(file_path)
+    elif ext in [".docx", ".doc"]:
+        # Return exact layout: line-by-line, order preserved, no grouping
+        return extract_docx_exact_layout(file_path)
+    else:
+        raise ValueError("Unsupported file type. Use PDF or DOCX.")
+
+# ================================
+# DOCX LINE-BY-LINE ORDER-PRESERVING EXTRACTION
+# ================================
+def extract_docx_exact_layout(filepath):
+    doc_result = docx2python(filepath)
+    main_content = doc_result.body
+    all_text = []
+    for section in main_content:
+        for row in section:
+            for cell in row:
+                for para in cell:
+                    para_str = para.strip()
+                    if para_str:
+                        all_text.append(para_str)
+    return all_text
+
+# ================================
+# PDF PARSING (COLUMN-AWARE & MERGED)
+# ================================
+def extract_column_aware_blocks(pdf_path, column_gap=50):
+    doc = fitz.open(pdf_path)
+    all_blocks = []
+    for page in doc:
+        blocks = page.get_text("blocks", sort=True)
+        blocks = sorted(blocks, key=lambda b: (b[0], b[1]))
+        left_col, right_col = [], []
+        if blocks:
+            page_width = page.rect.width
+            center_line = page_width / 2
+            for b in blocks:
+                x0, y0, x1, y1, text, *_ = b
+                if x1 < center_line - column_gap:
+                    left_col.append((y0, text.strip()))
+                else:
+                    right_col.append((y0, text.strip()))
+            left_col_sorted = [t for _, t in sorted(left_col)]
+            right_col_sorted = [t for _, t in sorted(right_col)]
+            combined = right_col_sorted + left_col_sorted
+            all_blocks.extend([t for t in combined if t])
+    doc.close()
+    return all_blocks
+
+def extract_pdf_blocks(pdf_path):
+    blocks_code1 = extract_column_aware_blocks(pdf_path)
+    md_text = pymupdf4llm.to_markdown(pdf_path)
+    blocks_code2 = [
+        block.strip()
+        for block in md_text.split("\n\n")
+        if block.strip() and len(block.strip()) > 5
+    ]
+    md_chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+    page_chunk_blocks = [
+        chunk["text"].strip()
+        for chunk in md_chunks
+        if isinstance(chunk, dict) and "text" in chunk and chunk["text"].strip()
+    ]
+
+    def jaccard_similarity(s1, s2, threshold=0.7):
+        set1, set2 = set(s1.lower().strip()), set(s2.lower().strip())
+        intersection = set1 & set2
+        union = set1 | set2
+        if not union:
+            return False
+        return len(intersection) / len(union) > threshold
+
+    missing_from_code2 = []
+    for block1 in blocks_code1:
+        if not any(jaccard_similarity(block1, block2) for block2 in blocks_code2):
+            missing_from_code2.append(block1)
+    final_blocks = blocks_code2 + missing_from_code2
+    return final_blocks, page_chunk_blocks
+
+# ================================
+# SEMANTIC HEADING DETECTION + SECTION GROUPING
+# ================================
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+canonical_headings = [
+    "experience", "work experience", "education", "academic history",
+    "projects", "technical projects", "skills", "key skills",
+    "certifications", "achievements", "publications", "personal details", "contact",
+    "technical skills", "professional experience"
+]
+canonical_embeddings = model.encode(canonical_headings, convert_to_tensor=True)
+
+def semantic_heading_detection(lines, threshold=0.6):
+    headings = []
+    for line in lines:
+        line_clean = line.strip().lower()
+        if not line_clean or len(line_clean) < 3:
+            continue
+        emb = model.encode(line_clean, convert_to_tensor=True)
+        cosine_scores = util.cos_sim(emb, canonical_embeddings)[0]
+        max_score = float(cosine_scores.max())
+        if max_score >= threshold:
+            headings.append(line.strip())
+    return headings
+
+def semantic_sectioning(lines, threshold=0.55):
+    detected_headings = semantic_heading_detection(lines, threshold)
+    sections = {}
+    current_section = None
+    buffer = []
+
+    for line in lines:
+        if line.strip() in detected_headings:
+            if current_section and buffer:
+                sections[current_section] = "\n".join(buffer).strip()
+            current_section = line.strip()
+            buffer = []
+        else:
+            buffer.append(line.strip())
+
+    if current_section and buffer:
+        sections[current_section] = "\n".join(buffer).strip()
+    return sections
+
+# ================================
+# ENHANCED NOUN CHUNK EXTRACTION
+# ================================
+nlp = spacy.load("en_core_web_md")
+def filter_and_clean_noun_chunks(doc):
+    seen = set()
+    clean_chunks = []
+    for chunk in doc.noun_chunks:
+        text = chunk.text.strip().lower()
+        if not text or len(text) < 2:
+            continue
+        if all(token.is_stop for token in chunk):
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        clean_chunks.append(text)
+    return clean_chunks
+
+def extract_section_noun_chunks(sections):
+    section_chunks = {}
+    for heading, text in sections.items():
+        flat = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        doc = nlp(flat)
+        noun_chunks = filter_and_clean_noun_chunks(doc)
+        section_chunks[heading] = noun_chunks
+    return section_chunks
+
+# ================================
+# DRIVER
+# ================================
+if __name__ == "__main__":
+    file_path = "3590975-restaurant-server-job-description-resume-example.pdf"
+    extracted_output = extract_text(file_path)
+
+    if isinstance(extracted_output, tuple):
+        final_blocks, page_chunks = extracted_output
+    else:
+        final_blocks = extracted_output
+        page_chunks = []
+
+    print(f"\nParsed Output from: {os.path.basename(file_path)}")
+    print("\n================ RAW PARSED TEXT BLOCKS ================\n")
+    for block in final_blocks:
+        print(block)
+        print("-" * 40)
+
+    print("\n================ SEMANTIC SECTIONING OUTPUT ================\n")
+    sections = semantic_sectioning(final_blocks)
+    for heading, content in sections.items():
+        print(f"\n### {heading.upper()} ###\n{content}\n")
+        print("=" * 60)
+
+    print("\n================ NOUN CHUNKS PER SECTION ================\n")
+    section_chunks = extract_section_noun_chunks(sections)
+    for heading, chunks in section_chunks.items():
+        print(f"\n### {heading.upper()} ###")
+        print(", ".join(chunks))
+        print("=" * 60)
